@@ -1,0 +1,29 @@
+# Build outputs
+Debug/
+Release/
+
+# IDE metadata (Eclipse-based)
+.metadata/
+.settings/
+.cproject_user/
+.project (optional if customizing)
+
+# Object files and binaries
+*.o
+*.elf
+*.hex
+*.bin
+*.map
+
+# Launch configs (user-specific debugger settings)
+*.launch
+
+# STM32Cube specifics (regenerate via CubeMX)
+STM32CubeIDE workspace files (if any)
+
+# OS/Editor junk
+.DS_Store
+Thumbs.db
+*~
+*.swp
+
