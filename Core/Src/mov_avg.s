@@ -17,7 +17,7 @@
  .align 2
 @ CG2028 Assignment, Sem 2, AY 2025/26
 @ (c) ECE NUS, 2025
-@ Karthikkeyan Vetrivel (A0307459W)
+@ Karthikeyan Vetrivel (A0307459W)
 @ Nicholas Lau Hongyi (A0308905B)
 @ You could create a look-up table of registers here:
 @ R0 = N (number of samples)
