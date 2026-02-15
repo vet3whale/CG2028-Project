@@ -17,7 +17,7 @@
 
 
 
-// ====================== HELPER FOR FALL DETECTION =========================
+/*--------------------------- Helper Functions ------------------------------*/
 static inline float absf(float x) {
     return (x < 0.0f) ? -x : x;
 }
@@ -26,15 +26,15 @@ static inline float sqrtf_approx(float x) {
     return sqrtf(x);
 }
 
-//======================= TYPES =========================
+/*--------------------------- Types -----------------------------------------*/
 
 typedef enum {
-    FALL_NORMAL = 0,
+    FALL_NORMAL,
     FALL_SUSPECT,
     FALL_CONFIRMED
 } fall_state_t;
 
-// ======================= CONSTANTS =========================
+/*--------------------------- Constants ---------------------------------------*/
 // Gravity
 #define G_NORM 9.8f
 
@@ -84,7 +84,7 @@ typedef enum {
 #define END_AFTER_MS 4000
 
 
-// ================= MODULE STATE ===================
+/*--------------------------- Module State ---------------------------------------*/
 // fall/trigger state
 static fall_state_t fall_state = FALL_NORMAL;
 static uint32_t t_confirm_ms = 0;
@@ -111,7 +111,7 @@ static uint32_t axis_candidate_ms = 0;
 static int axis_candidate = -1;
 static uint32_t last_orient_trigger_ms = 0;
 
-// ================== FORWARD DECLARATIONS ========================
+/*--------------------------- Forward Declarations ---------------------------------------*/
 static void UART1_Init(void);
 extern void initialise_monitor_handles(void);
 extern int mov_avg(int N, int* accel_buff);
@@ -154,7 +154,7 @@ int main(void)
         float* ptr_gyro = gyro_data;
         BSP_GYRO_GetXYZ(ptr_gyro);
 
-        // gyro "velocity" (keeping your math)
+        // gyro "velocity"
         float gyro_velocity[3] = {0.0f};
         gyro_velocity[0] = (gyro_data[0] * 9.8f / 1000.0f);
         gyro_velocity[1] = (gyro_data[1] * 9.8f / 1000.0f);
