@@ -17,7 +17,7 @@
  .align 2
 @ CG2028 Assignment, Sem 2, AY 2025/26
 @ (c) ECE NUS, 2025
-@ Karthikkeyan Vetrivel (A0307459W)
+@ Karthikeyan Vetrivel (A0307459W)
 @ Nicholas Lau Hongyi (A0308905B)
 @ You could create a look-up table of registers here:
 @ R0 = N (number of samples)
@@ -25,34 +25,28 @@
 @ Returns R0 = integer average of the N samples
 @ write your program from here:
 mov_avg:
-    @ Save registers (matches template spirit) + keep stack 8-byte aligned
-    push {r2-r11, lr}          @ 10 regs = 40 bytes -> aligned
+ PUSH {r2-r11, lr}
 
-    @ If N <= 0, return 0
-    cmp  r0, #0
-    ble  .ret_zero
+ MOV r2, #0
+ MOV r4, #0
 
-    @ Optional clamp to N_MAX (keep if your lab uses max 8)
-    cmp  r0, #N_MAX
-    ble  .N_ok
-    movs r0, #N_MAX
-.N_ok:
+LOOP:
+ CMP r0, #0
+ BEQ DONE
 
-    mov  r4, r0                @ r4 = N (loop counter)
-    mov  r5, r1                @ r5 = accel_buff pointer
-    movs r2, #0                @ r2 = sum = 0
+ LDR r3, [r1], #4
+ ADD r2, r3
+ SUBS r0, #1
+ ADD r4, #1
+ B LOOP
 
-.sum_loop:
-    ldr  r3, [r5], #4          @ r3 = *r5; r5 += 4
-    adds r2, r2, r3            @ sum += r3
-    subs r4, r4, #1            @ counter--
-    bne  .sum_loop             @ loop until counter == 0
+DONE:
+ CMP r4, #0
+ BEQ ZERO
+ SDIV r0, r2, r4
+ B EXIT
 
-    @ average = sum / N
-    sdiv r0, r2, r0            @ return in r0
-
-    pop  {r2-r11, pc}          @ restore regs and return
-
-.ret_zero:
-    movs r0, #0
-    pop  {r2-r11, pc}
+ZERO:
+ MOV r0, #0
+EXIT:
+ POP {r2-r11, pc}
