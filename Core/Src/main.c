@@ -173,27 +173,37 @@ int main(void)
         if (!freeze_uart && i >= 3 && (now - last_uart_print_ms) >= UART_PRINT_PERIOD_MS)
         {
             sprintf(buffer, "Results of assembly execution for filtered accelerometer readings:\r\n");
-            HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+            // HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 
             sprintf(buffer, "Averaged X : %f; Averaged Y : %f; Averaged Z : %f;\r\n",
                     accel_filt_asm[0], accel_filt_asm[1], accel_filt_asm[2]);
-            HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+            // HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 
             sprintf(buffer, "Gyroscope sensor readings:\r\n");
-            HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+            // HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 
             sprintf(buffer, "Averaged X : %f; Averaged Y : %f; Averaged Z : %f;\r\n\n",
                     gyro_velocity[0], gyro_velocity[1], gyro_velocity[2]);
-            HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+            // HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 
             sprintf(buffer, "a_mag : %f; g_mag : %f; jerk : %f\r\n\n",
             		a_mag, g_mag, jerk);
-            HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+            // HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 
             last_uart_print_ms = now;
         }
 
         // ********* Fall detection: free-fall -> confirm by impact/rotation/orientation-change *********
+        uint32_t t_ms = HAL_GetTick();
+        sprintf(buffer, "%lu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\r\n",
+                t_ms,
+        		accel_filt_asm[0],
+                accel_filt_asm[1],
+                accel_filt_asm[2],
+				gyro_velocity[0],
+				gyro_velocity[1],
+				gyro_velocity[2]);
+        HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 
         // ********* Rotation/orientation trigger: dominant axis switch (X<->Y<->Z) *********
 
