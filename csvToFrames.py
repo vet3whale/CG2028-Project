@@ -1,12 +1,26 @@
 import csv
-import math
 import sys
 from pathlib import Path
 
-import matplotlib.pyplot as plt
+import sys
+from pathlib import Path
 import numpy as np
+import imageio.v2 as imageio
+
+import trimesh
+import pyrender
 from scipy.spatial.transform import Rotation as R
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+W, H = 512, 512
+
+def load_trimesh_obj(path: Path) -> trimesh.Trimesh:
+    tm = trimesh.load(str(path), force="mesh")
+    if isinstance(tm, trimesh.Scene):
+        tm = trimesh.util.concatenate(list(tm.geometry.values()))
+    # center + scale for stable camera framing
+    tm.vertices -= tm.vertices.mean(axis=0)
+    tm.vertices /= np.max(np.linalg.norm(tm.vertices, axis=1))
+    return tm
 
 def load_rows(in_csv: Path):
     rows = []
@@ -22,117 +36,62 @@ def load_rows(in_csv: Path):
         raise RuntimeError(f"No data rows in {in_csv}")
     return rows
 
-def set_black_background(fig, ax):
-    fig.patch.set_facecolor("black")
-    ax.set_facecolor("black")
-    ax.set_axis_off()
 
-    ax.grid(False)
+def main(csv_path, out_dir):
+    out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Load mesh -> pyrender mesh
+    tm = load_trimesh_obj(Path("human.obj"))
+    pr_mesh = pyrender.Mesh.from_trimesh(tm, smooth=False)
 
-def make_cuboid_vertices(w=0.5, d=0.2, h=1.5):
-    # half-dimensions
-    x, y, z = w/2, d/2, h/2
-    V = np.array([
-        [-x, -y, -z],
-        [ x, -y, -z],
-        [ x,  y, -z],
-        [-x,  y, -z],
-        [-x, -y,  z],
-        [ x, -y,  z],
-        [ x,  y,  z],
-        [-x,  y,  z],
-    ])
-    # faces as lists of 4 vertices (quads)
-    faces = [
-        [0, 1, 2, 3],  # bottom
-        [4, 5, 6, 7],  # top
-        [0, 1, 5, 4],  # side
-        [1, 2, 6, 5],  # side
-        [2, 3, 7, 6],  # side
-        [3, 0, 4, 7],  # side
-    ]
-    return V, faces
+    scene = pyrender.Scene(bg_color=[0, 0, 0, 255], ambient_light=[0.2, 0.2, 0.2, 1.0])
+    mesh_node = scene.add(pr_mesh)
 
+    camera = pyrender.PerspectiveCamera(yfov=np.pi / 3.0)
+    cam_pos = np.array([1.5, 1.5, 2.5], dtype=float)   # top-right
+    target  = np.array([0.0, 0.0, 0.0], dtype=float)
+    up_hint = np.array([0.0, 1.0, 0.0], dtype=float)
 
-def draw_cuboid(ax, verts, faces):
-    polys = [[verts[idx] for idx in face] for face in faces]
+    forward = (target - cam_pos)
+    forward = forward / np.linalg.norm(forward)
 
-    face_colors = [
-        "#ff3b30",  # bottom - red
-        "#34c759",  # top - green
-        "#0a84ff",  # side - blue
-        "#ff9f0a",  # side - orange
-        "#bf5af2",  # side - purple
-        "#ffd60a",  # side - yellow
-    ]
+    right = np.cross(forward, up_hint)
+    right = right / np.linalg.norm(right)
 
-    pc = Poly3DCollection(
-        polys,
-        facecolors=face_colors,
-        linewidths=1.0,
-    )
-    ax.add_collection3d(pc)
+    up = np.cross(right, forward)
+
+    cam_pose = np.eye(4, dtype=float)
+    cam_pose[:3, 0] = right
+    cam_pose[:3, 1] = up
+    cam_pose[:3, 2] = -forward   # OpenGL camera +Z points “back”
+    cam_pose[:3, 3] = cam_pos
+
+    scene.add(camera, pose=cam_pose)
 
 
-def main():
-    if len(sys.argv) < 3:
-        print("Usage: python csv_to_frames.py <input_csv> <output_frames_dir>")
-        sys.exit(2)
+    light = pyrender.DirectionalLight(color=np.ones(3), intensity=2.0)
+    scene.add(light, pose=cam_pose)
 
-    in_csv = Path(sys.argv[1])
-    out_dir = Path(sys.argv[2])
-    out_dir.mkdir(parents=True, exist_ok=True)
+    r = pyrender.OffscreenRenderer(viewport_width=W, viewport_height=H)
 
-    rows = load_rows(in_csv)
+    rows = load_rows(Path(csv_path))
 
-    # Base cuboid geometry
-    base_verts, faces = make_cuboid_vertices(w=0.6, d=0.2, h=1.6)
-
-    # Initial orientation: identity
     R_cur = R.identity()
-
-    # Fix plot limits so cuboid doesn't rescale each frame
-    axis_lim = 1.2 
-
     for i in range(len(rows)):
-        if i == 0:
-            dt = 0.0
-        else:
-            dt = (rows[i]["t_ms"] - rows[i - 1]["t_ms"]) / 1000.0
-
-        # Angular velocity vector (deg/s) -> small rotation over dt (deg)
-        gx = rows[i]["gx"]
-        gy = rows[i]["gy"]
-        gz = rows[i]["gz"]
-        angle_deg = np.array([gx, gy, gz]) * dt
-
-        # Incremental rotation; choose axis order to match your IMU convention
+        dt = 0.0 if i == 0 else (rows[i]["t_ms"] - rows[i-1]["t_ms"]) / 1000.0
+        angle_deg = np.array([rows[i]["gx"], rows[i]["gy"], rows[i]["gz"]]) * dt
         dR = R.from_euler("xyz", angle_deg, degrees=True)
-        R_cur = dR * R_cur  # compose new orientation
+        R_cur = dR * R_cur
 
-        # Rotate cuboid vertices
-        verts_rot = R_cur.apply(base_verts)
+        # pose for pyrender node (4x4)
+        pose = np.eye(4)
+        pose[:3, :3] = R_cur.as_matrix()
+        scene.set_pose(mesh_node, pose=pose)  # Scene can update node pose
 
-        # Draw cuboid
-        fig = plt.figure(figsize=(5, 5))
-        ax = fig.add_subplot(111, projection="3d")
-        set_black_background(fig, ax)
-        draw_cuboid(ax, verts_rot, faces)
+        color, depth = r.render(scene)  # returns image arrays
+        imageio.imwrite(out_dir / f"frame_{i:03d}.png", color)
 
-        # Fix axes for consistency across frames
-        ax.set_xlim(-axis_lim, axis_lim)
-        ax.set_ylim(-axis_lim, axis_lim)
-        ax.set_zlim(-axis_lim, axis_lim)
-        ax.set_box_aspect([1, 1, 1])
-
-        out_path = out_dir / f"frame_{i:03d}.png"
-        plt.tight_layout()
-        plt.savefig(out_path, dpi=120)
-        plt.close()
-
-    print(f"Wrote {len(rows)} 3D cube frames to {out_dir}")
-
+    r.delete()
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1], sys.argv[2])
