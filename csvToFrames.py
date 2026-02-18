@@ -20,14 +20,23 @@ def load_trimesh_obj(path: Path) -> trimesh.Trimesh:
     return tm
 
 def load_rows(in_csv: Path):
+    def remap(ax, ay, az):
+        # X' = -Z, Y' = -X, Z' = -Y
+        return ay, -az, ax
     rows = []
     with open(in_csv, newline="", encoding="utf-8") as f:
         r = csv.DictReader(f)
         for row in r:
+            ax, ay, az = float(row["ax"]), float(row["ay"]), float(row["az"])
+            gx, gy, gz = float(row["gx"]), float(row["gy"]), float(row["gz"])
+
+            ax, ay, az = remap(ax, ay, az)
+            gx, gy, gz = remap(gx, gy, gz)
+
             rows.append({
                 "t_ms": int(row["t_ms"]),
-                "ax": float(row["ax"]), "ay": float(row["ay"]), "az": float(row["az"]),
-                "gx": float(row["gx"]), "gy": float(row["gy"]), "gz": float(row["gz"]),
+                "ax": ax, "ay": ay, "az": az,
+                "gx": gx, "gy": gy, "gz": gz,
             })
     if not rows:
         raise RuntimeError(f"No data rows in {in_csv}")
