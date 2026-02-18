@@ -1,9 +1,6 @@
 import csv
 import sys
 from pathlib import Path
-
-import sys
-from pathlib import Path
 import numpy as np
 import imageio.v2 as imageio
 

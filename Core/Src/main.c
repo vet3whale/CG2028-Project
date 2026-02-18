@@ -345,6 +345,13 @@ static void process_axis_transition(uint32_t now, int top1_axis, char current_si
             sprintf(buffer, "\r\n!!! FALL DETECTED !!!\r\n");
             HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 
+            // telegram machine readable line
+            // ----- Telegram machine-readable line -----
+            float peak_g = latched_a_mag / G_NORM;   // latched_a_mag is in m/s^2 in his code
+            sprintf(buffer, "FALL axis=%d->%d peak_g=%.2f lying_s=%d\r\n",
+                    prev_axis, top1_axis, peak_g, 5);
+            HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+
             // Use the LATCHED variables to see what caused the fall
             if (latched_rot && latched_jerk) {
                 sprintf(buffer, "TRIGGER  : ROT + JERK\r\n");
@@ -419,3 +426,4 @@ int _isatty(int file) { return 1; }
 int _close(int file) { return -1; }
 int _getpid(void) { return 1; }
 int _kill(int pid, int sig) { return -1; }
+
