@@ -12,7 +12,7 @@
 
 #include "main.h"
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_accelero.h"
-#include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_tsensor.h"
+#include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_psensor.h"
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_gyro.h"
 
 
@@ -59,6 +59,11 @@ typedef enum {
 // Trigger Thresholds
 // the acceleration it needs to trigger fall
 #define TRIGGER_A_MIN 12.0f
+
+// Barometer Filter
+#define PRESSURE_EMA_ALPHA 0.15f
+#define BARO_COUNT 100 // for calibration
+#define SAMPLING_COUNT 1
 
 // LED Blink Behaviour
 
@@ -112,7 +117,7 @@ static float latched_a_mag = 0.0f;
 static void UART1_Init(void);
 extern void initialise_monitor_handles(void);
 extern int mov_avg(int N, int* accel_buff);
-static void process_axis_transition(uint32_t now, int top1_axis, char current_sign);
+static void process_axis_transition(uint32_t now, int top1_axis, char current_sign, float base_pressure, float filtered_pressure);
 
 // ============== UART Peripherals =========================
 UART_HandleTypeDef huart1;
@@ -127,6 +132,7 @@ int main(void)
     BSP_LED_Init(LED2);
     BSP_ACCELERO_Init();
     BSP_GYRO_Init();
+    BSP_PSENSOR_Init();
 
     BSP_LED_Off(LED2);
 
@@ -138,7 +144,31 @@ int main(void)
 
     float a_mag, g_mag, jerk = 0;
 
-    while (!stop_loop)
+    float total_base_pressure = 0;
+
+	char buffer[150];
+	sprintf(buffer, "Stand up straight and wear the device\r\n");
+	HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+
+	HAL_Delay(3000);
+
+	sprintf(buffer, "Calibrating Barometer... Keep the board stationary\r\n");
+    HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+	for (int i = 0; i < BARO_COUNT; i++) {
+		total_base_pressure += BSP_PSENSOR_ReadPressure();
+	}
+
+	float base_pressure = total_base_pressure / BARO_COUNT;
+	sprintf(buffer, "Calibration done!\r\n");
+	HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+	total_base_pressure = 0;
+
+	float filtered_pressure = base_pressure;
+	float current_altitude = 0.0f;
+
+	int baro_count = 0;
+
+	while (!stop_loop)
     {
         int16_t accel_data_i16[3] = {0};
         BSP_ACCELERO_AccGetXYZ(accel_data_i16);
@@ -165,44 +195,28 @@ int main(void)
         accel_filt_asm[1] = (float)mov_avg(N, accel_buff_y) * (9.8f / 1000.0f);
         accel_filt_asm[2] = (float)mov_avg(N, accel_buff_z) * (9.8f / 1000.0f);
 
+        float raw_pressure = BSP_PSENSOR_ReadPressure();
+        total_base_pressure += raw_pressure;
+        baro_count++;
+
+        if (baro_count >= SAMPLING_COUNT) {
+            float avg = total_base_pressure / (float)SAMPLING_COUNT;
+            filtered_pressure = PRESSURE_EMA_ALPHA * avg +
+                                (1.0f - PRESSURE_EMA_ALPHA) * filtered_pressure;
+            current_altitude = 44330.0f * (1.0f - powf(filtered_pressure / base_pressure, 0.190295f));
+            total_base_pressure = 0.0f;
+            baro_count = 0;
+        }
 
         /***************************UART transmission*******************************************/
-        char buffer[150];
         uint32_t now = HAL_GetTick();
-
-        if (!freeze_uart && i >= 3 && (now - last_uart_print_ms) >= UART_PRINT_PERIOD_MS)
-        {
-            sprintf(buffer, "Results of assembly execution for filtered accelerometer readings:\r\n");
-            // HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
-
-            sprintf(buffer, "Averaged X : %f; Averaged Y : %f; Averaged Z : %f;\r\n",
-                    accel_filt_asm[0], accel_filt_asm[1], accel_filt_asm[2]);
-            // HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
-
-            sprintf(buffer, "Gyroscope sensor readings:\r\n");
-            // HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
-
-            sprintf(buffer, "Averaged X : %f; Averaged Y : %f; Averaged Z : %f;\r\n\n",
-                    gyro_velocity[0], gyro_velocity[1], gyro_velocity[2]);
-            // HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
-
-            sprintf(buffer, "a_mag : %f; g_mag : %f; jerk : %f\r\n\n",
-            		a_mag, g_mag, jerk);
-            // HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
-
-            last_uart_print_ms = now;
-        }
 
         // ********* Fall detection: free-fall -> confirm by impact/rotation/orientation-change *********
         uint32_t t_ms = HAL_GetTick();
-        sprintf(buffer, "%lu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\r\n",
+        sprintf(buffer, "%lu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\r\n",
                 t_ms,
-        		accel_filt_asm[0],
-                accel_filt_asm[1],
-                accel_filt_asm[2],
-				gyro_velocity[0],
-				gyro_velocity[1],
-				gyro_velocity[2]);
+        		accel_filt_asm[0], accel_filt_asm[1], accel_filt_asm[2],
+				gyro_velocity[0], gyro_velocity[1], gyro_velocity[2], current_altitude);
         HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 
         // ********* Rotation/orientation trigger: dominant axis switch (X<->Y<->Z) *********
@@ -290,7 +304,7 @@ int main(void)
                         axis_candidate = top1_axis;
                         axis_candidate_ms = now;
                     }
-                    process_axis_transition(now, top1_axis, current_sign);
+                    process_axis_transition(now, top1_axis, current_sign, base_pressure, filtered_pressure);
                 }
                 // same axis, keep candidate in sync
                 else
@@ -331,7 +345,7 @@ int main(void)
 }
 
 // confirms axis transition if it persists long enough AND cooldown passed
-static void process_axis_transition(uint32_t now, int top1_axis, char current_sign)
+static void process_axis_transition(uint32_t now, int top1_axis, char current_sign, float base_pressure, float filtered_pressure)
 {
     // check how long new axis has been stable
     if ((now - axis_candidate_ms) >= ORIENT_DEBOUNCE_MS)
@@ -347,9 +361,15 @@ static void process_axis_transition(uint32_t now, int top1_axis, char current_si
 
             // telegram machine readable line
             // ----- Telegram machine-readable line -----
+            HAL_Delay(1000); // one sec to stabilise
+            float raw_pressure = BSP_PSENSOR_ReadPressure();
+            filtered_pressure = PRESSURE_EMA_ALPHA * raw_pressure +
+								(1.0f - PRESSURE_EMA_ALPHA) * filtered_pressure;
+			float current_altitude = 44330.0f * (1.0f - powf(filtered_pressure / base_pressure, 0.190295f));
+
             float peak_g = latched_a_mag / G_NORM;   // latched_a_mag is in m/s^2 in his code
-            sprintf(buffer, "FALL axis=%d->%d peak_g=%.2f lying_s=%d\r\n",
-                    prev_axis, top1_axis, peak_g, 5);
+            sprintf(buffer, "FALL axis=%c%c -> %c%c peak_g=%.2f lying_s=%d fall_alt=%.3f\r\n",
+            		prev_sign, axes_names[prev_axis], current_sign, axes_names[top1_axis], peak_g, 5, current_altitude);
             HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 
             // Use the LATCHED variables to see what caused the fall
