@@ -21,6 +21,7 @@ PORT = "COM3"
 BAUD = 115200
 TIMEOUT_S = 1
 
+# !!! IMPORTANT: Rotate this token (it was exposed). Then paste the new token here.
 BOT_TOKEN = "8463120288:AAEjTsTXQ1YChPB53w92LNjCf_6rKWwlPJo"
 CHAT_ID = "-3576715549"  # supergroup chat id
 
@@ -425,6 +426,14 @@ def run_postprocess(csv_file: Path):
 
 def uart_loop():
     global last_telegram_sent, pending_video_upload, post_capture_started_ts
+
+    # Capture half pre-trigger + half post-trigger:
+    pre_trigger_len = BUFFER_LEN // 2
+    post_trigger_samples_needed = BUFFER_LEN - pre_trigger_len
+
+    buf = deque(maxlen=pre_trigger_len)
+    post_trigger_buffer = []
+    capturing_post = False
 
     # Capture half pre-trigger + half post-trigger:
     pre_trigger_len = BUFFER_LEN // 2
