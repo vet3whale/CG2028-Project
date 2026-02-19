@@ -21,9 +21,8 @@ PORT = "COM3"
 BAUD = 115200
 TIMEOUT_S = 1
 
-# !!! IMPORTANT: Rotate this token (it was exposed). Then paste the new token here.
 BOT_TOKEN = "8463120288:AAEjTsTXQ1YChPB53w92LNjCf_6rKWwlPJo"
-CHAT_ID = "-3576715549"  # supergroup chat id
+CHAT_ID = "-1003576715549"  # supergroup chat id
 
 NIC_NUMBER = "+6588181916"
 
@@ -38,6 +37,8 @@ TRIGGER_TEXTS = [
     "!!! FALL DETECTED !!!",
     "FALL axis=",
 ]
+
+ASSIST_TEXT = "Not a False Alarm! User needs assistance!"
 
 # Where to save outputs
 ROOT = Path(__file__).parent
@@ -94,6 +95,8 @@ def send_message(text: str, reply_markup=None):
     if not r.ok:
         print("Telegram sendMessage failed:", r.status_code, r.text)
         r.raise_for_status()
+    else:
+        print("Telegram message sent!")
     return r.json()
 
 def send_video(video_path: str, caption: str | None = None):
@@ -180,21 +183,26 @@ def build_alert_text(axis_change, peak_g, lying_s, fall_alt):
 def parse_machine_fall_line(line: str):
     m = re.search(
         r"FALL\s+axis=([+-][XYZ])\s*->\s*([+-][XYZ])\s+"
-        r"peak_g=([0-9.]+)\s+lying_s=(\d+)\s+fall_alt=([0-9.]+)",
-        line
+        r"peak_g=([0-9]*\.?[0-9]+)\s+lying_s=(\d+)\s+"
+        r"fall_alt=([-+]?(?:nan|[0-9]*\.?[0-9]+))",
+        line, re.IGNORECASE
     )
     if not m:
         return None
 
-    axis_from = m.group(1)   # "+X"
-    axis_to   = m.group(2)   # "-Z"
+    axis_from = m.group(1)
+    axis_to = m.group(2)
+
+    fall_alt_str = m.group(5).lower()
+    fall_alt = float("nan") if fall_alt_str == "nan" else float(fall_alt_str)
 
     return {
-        "axis_change": f"{axis_from} -> {axis_to}",  # string
+        "axis_change": f"{axis_from} -> {axis_to}",
         "peak_g": float(m.group(3)),
         "lying_s": int(m.group(4)),
-        "fall_alt": float(m.group(5)),
+        "fall_alt": fall_alt,
     }
+
 
 # ========================= Reminder State ========================
 @dataclass
@@ -435,14 +443,6 @@ def uart_loop():
     post_trigger_buffer = []
     capturing_post = False
 
-    # Capture half pre-trigger + half post-trigger:
-    pre_trigger_len = BUFFER_LEN // 2
-    post_trigger_samples_needed = BUFFER_LEN - pre_trigger_len
-
-    buf = deque(maxlen=pre_trigger_len)
-    post_trigger_buffer = []
-    capturing_post = False
-
     port = auto_detect_port()
     ser = serial.Serial(port, BAUD, timeout=TIMEOUT_S)
     print(f"Listening on {ser.port} @ {BAUD}...")
@@ -491,6 +491,13 @@ def uart_loop():
                             print("Video upload failed (delayed):", e)
                         pending_video_upload = False
             continue  # important: don't treat IMU lines as triggers
+        
+        if ASSIST_TEXT in line:
+            now = time.time()
+            if now - last_telegram_sent >= TELEGRAM_COOLDOWN_S:
+                send_message("🚨 " + ASSIST_TEXT)
+                last_telegram_sent = now
+            continue
 
         # 2) Trigger handling (non-CSV lines)
         is_video_trigger = ("!!! FALL DETECTED !!!" in line) or ("FALL DETECTED" == line)

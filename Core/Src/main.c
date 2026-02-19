@@ -122,6 +122,17 @@ static void process_axis_transition(uint32_t now, int top1_axis, char current_si
 // ============== UART Peripherals =========================
 UART_HandleTypeDef huart1;
 
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if (GPIO_Pin == USER_BUTTON_PIN)
+  {
+	  char buffer[150];
+	  sprintf(buffer, "Not a False Alarm! User needs assistance!\r\n");
+	  HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+  }
+}
+
+
 int main(void)
 {
     const int N = 4;
@@ -135,6 +146,7 @@ int main(void)
     BSP_PSENSOR_Init();
 
     BSP_LED_Off(LED2);
+    BSP_PB_Init(BUTTON_USER, BUTTON_MODE_EXTI);
 
     int accel_buff_x[4] = {0};
     int accel_buff_y[4] = {0};
@@ -355,13 +367,13 @@ static void process_axis_transition(uint32_t now, int top1_axis, char current_si
         {
             char axes_names[] = {'X', 'Y', 'Z'};
             char buffer[150];
+            HAL_Delay(100); // one sec to stabilise
 
             sprintf(buffer, "\r\n!!! FALL DETECTED !!!\r\n");
             HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 
             // telegram machine readable line
             // ----- Telegram machine-readable line -----
-            HAL_Delay(1000); // one sec to stabilise
             float raw_pressure = BSP_PSENSOR_ReadPressure();
             filtered_pressure = PRESSURE_EMA_ALPHA * raw_pressure +
 								(1.0f - PRESSURE_EMA_ALPHA) * filtered_pressure;
