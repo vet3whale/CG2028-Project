@@ -7,13 +7,16 @@ import subprocess
 import sys
 import time
 import threading
+import random
+import requests
+import serial
+ 
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-
-import requests
-import serial
 from serial.tools import list_ports
 
 # ===================== CONFIG =====================
@@ -21,22 +24,39 @@ PORT = "COM3"
 BAUD = 115200
 TIMEOUT_S = 1
 
+SER = None
+
 BOT_TOKEN = "8463120288:AAEjTsTXQ1YChPB53w92LNjCf_6rKWwlPJo"
 CHAT_ID = "-1003576715549"  # supergroup chat id
 
-NIC_NUMBER = "+6588181916"
+AMBULANCE_NUMBER = "995"
 
 # How many IMU samples to keep for video
 SAMPLE_RATE = 50
 CLIP_SECONDS = 3
 BUFFER_LEN = SAMPLE_RATE * CLIP_SECONDS
 
-# Trigger texts that may appear from STM32
+# NOTE: Unused in current logic, kept for reference.
 TRIGGER_TEXTS = [
     "FALL DETECTED",
     "!!! FALL DETECTED !!!",
     "FALL axis=",
 ]
+
+SESSION = requests.Session()
+_retry = Retry(
+    total=5,
+    connect=5,
+    read=5,
+    status=5,
+    backoff_factor=0.5,
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=frozenset(["GET", "POST"]),
+    raise_on_status=False,
+)
+adapter = HTTPAdapter(max_retries=_retry, pool_connections=10, pool_maxsize=10)
+SESSION.mount("https://", adapter)
+SESSION.mount("http://", adapter)
 
 ASSIST_TEXT = "Not a False Alarm! User needs assistance!"
 
@@ -50,7 +70,10 @@ CSV_TO_FRAMES_CANDIDATES = [
     ROOT / "csvToFrames.py",
     ROOT / "csvtoframes.py",
 ]
-CSV_TO_FRAMES = next((p for p in CSV_TO_FRAMES_CANDIDATES if p.exists()), CSV_TO_FRAMES_CANDIDATES[0])
+CSV_TO_FRAMES = next(
+    (p for p in CSV_TO_FRAMES_CANDIDATES if p.exists()),
+    CSV_TO_FRAMES_CANDIDATES[0],
+)
 
 # CSV format from STM32 stream
 FIELDNAMES = ["t_ms", "ax", "ay", "az", "gx", "gy", "gz", "fall_alt"]
@@ -63,12 +86,18 @@ REMIND_EVERY_SECONDS = 15
 MAX_REMINDERS = 999999
 
 POST_CAPTURE_TIMEOUT_S = 2.0  # finalize even if we don't get enough samples
-post_capture_started_ts = None
 
+# ===================== RUNTIME STATE =====================
+API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+last_telegram_sent = 0.0
+
+post_capture_started_ts = None
 pending_video_upload = False  # set True when we send alert but mp4 not ready yet
+pending_reminder_start = None
+
 
 # ========================= PORT DETECTION =======================
-def auto_detect_port():
+def auto_detect_port() -> str:
     ports = list_ports.comports()
     for p in ports:
         desc = (p.description or "").lower()
@@ -82,22 +111,46 @@ def auto_detect_port():
 
     raise RuntimeError("No serial ports found.")
 
-# ========================= TELEGRAM API ========================
-API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-last_telegram_sent = 0.0
+# ======================= STM32 Buzzer Helpers ========================
+def get_ser():
+    global SER
+    if SER is None or not SER.is_open:
+        raise RuntimeError("Serial not initialized yet. uart_loop() must start first.")
+    return SER
+
+def send_to_stm32(cmd: str):
+    try:
+        s = get_ser()
+        s.write((cmd.strip() + "\n").encode("utf-8"))
+        s.flush()
+        print("Sent:", cmd)
+    except Exception as e:
+        print("Failed to send to STM32:", e)
+
+# ========================= TELEGRAM HELPERS ========================
+def _tg_post(method: str, *, data=None, files=None, timeout=15):
+    url = f"{API}/{method}"
+    r = SESSION.post(url, data=data, files=files, timeout=timeout)
+    if not r.ok:
+        print(f"Telegram {method} failed:", r.status_code, r.text)
+        r.raise_for_status()
+    return r.json()
+
+def _tg_get(method: str, *, params=None, timeout=35):
+    url = f"{API}/{method}"
+    r = SESSION.get(url, params=params, timeout=timeout)
+    if not r.ok:
+        print(f"Telegram {method} failed:", r.status_code, r.text)
+    return r
 
 def send_message(text: str, reply_markup=None):
     payload = {"chat_id": CHAT_ID, "text": text}
     if reply_markup is not None:
         payload["reply_markup"] = json.dumps(reply_markup)
 
-    r = requests.post(f"{API}/sendMessage", data=payload, timeout=15)
-    if not r.ok:
-        print("Telegram sendMessage failed:", r.status_code, r.text)
-        r.raise_for_status()
-    else:
-        print("Telegram message sent!")
-    return r.json()
+    resp = _tg_post("sendMessage", data=payload, timeout=15)
+    print("✅ Telegram message sent!")
+    return resp
 
 def send_video(video_path: str, caption: str | None = None):
     with open(video_path, "rb") as f:
@@ -106,13 +159,7 @@ def send_video(video_path: str, caption: str | None = None):
         if caption:
             data["caption"] = caption
 
-        r = requests.post(f"{API}/sendVideo", data=data, files=files, timeout=60)
-
-    if not r.ok:
-        print("Telegram sendVideo failed:", r.status_code, r.text)
-        r.raise_for_status()
-
-    return r.json()
+        return _tg_post("sendVideo", data=data, files=files, timeout=60)
 
 def edit_message_text(chat_id: int, message_id: int, text: str, reply_markup=None):
     payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
@@ -121,11 +168,7 @@ def edit_message_text(chat_id: int, message_id: int, text: str, reply_markup=Non
     else:
         payload["reply_markup"] = json.dumps({"inline_keyboard": []})
 
-    r = requests.post(f"{API}/editMessageText", data=payload, timeout=15)
-    if not r.ok:
-        print("Telegram editMessageText failed:", r.status_code, r.text)
-        r.raise_for_status()
-    return r.json()
+    return _tg_post("editMessageText", data=payload, timeout=15)
 
 def edit_message_reply_markup(chat_id: int, message_id: int, reply_markup=None):
     payload = {"chat_id": chat_id, "message_id": message_id}
@@ -134,52 +177,51 @@ def edit_message_reply_markup(chat_id: int, message_id: int, reply_markup=None):
     else:
         payload["reply_markup"] = json.dumps({"inline_keyboard": []})
 
-    r = requests.post(f"{API}/editMessageReplyMarkup", data=payload, timeout=15)
-    if not r.ok:
-        print("Telegram editMessageReplyMarkup failed:", r.status_code, r.text)
-    return r.json() if r.ok else None
+    try:
+        return _tg_post("editMessageReplyMarkup", data=payload, timeout=15)
+    except Exception as e:
+        # match your original "print but don't crash" behavior
+        print("Telegram editMessageReplyMarkup failed:", e)
+        return None
 
-def delete_message(chat_id: int, message_id: int):
-    r = requests.post(
-        f"{API}/deleteMessage",
-        data={"chat_id": chat_id, "message_id": message_id},
-        timeout=15
-    )
-    if not r.ok:
-        print("Telegram deleteMessage failed:", r.status_code, r.text)
-    return r.ok
+def delete_message(chat_id: int, message_id: int) -> bool:
+    try:
+        _tg_post("deleteMessage", data={"chat_id": chat_id, "message_id": message_id}, timeout=15)
+        return True
+    except Exception as e:
+        print("Telegram deleteMessage failed:", e)
+        return False
 
 def answer_callback_query(callback_query_id: str):
     try:
-        r = requests.post(
-            f"{API}/answerCallbackQuery",
-            data={"callback_query_id": callback_query_id},
-            timeout=10
-        )
-        if not r.ok:
-            print("Ignoring old/invalid callback:", r.text)
+        _tg_post("answerCallbackQuery", data={"callback_query_id": callback_query_id}, timeout=10)
     except Exception as e:
+        # keep ignore behavior
         print("Callback answer failed (ignored):", e)
 
+
+# ========================= UI BUILDERS ========================
 def build_keyboard():
     return {
         "inline_keyboard": [
-            [{"text": "False Alarm! Don’t Take Action", "callback_data": "false_alarm"}],
-            [{"text": "Contact Nic", "callback_data": "contact_nic"}],
+            [{"text": "✅ False Alarm! Don't Take Action!", "callback_data": "false_alarm"}],
+            [{"text": "🚑 Call Ambulance!", "callback_data": "call_ambulance"}],
         ]
     }
 
 def build_alert_text(axis_change, peak_g, lying_s, fall_alt):
     return (
-        "User has fallen at home!\n\n"
-        f"Details:\n"
-        f"- Rotation detected.\n"
-        f"- Fall axis: {axis_change}\n"
-        f"- Peak acceleration: {peak_g:.2f} g\n"
-        f"- Lying duration: {lying_s} seconds\n"
-        f"- Fall distance: {fall_alt}m\n"
+        "🚨 *FALL DETECTED!*\n\n"
+        f"📌 *Details:*\n"
+        f"- 🔄 Rotation detected.\n"
+        f"- 🧭 Fall axis: {axis_change}\n"
+        f"- 💥 Peak acceleration: {peak_g:.2f} g\n"
+        f"- 🧍‍♂️Lying duration: {lying_s} seconds\n"
+        f"- 📏 Fall distance: {fall_alt}m\n"
     )
 
+
+# ========================= PARSERS ========================
 def parse_machine_fall_line(line: str):
     m = re.search(
         r"FALL\s+axis=([+-][XYZ])\s*->\s*([+-][XYZ])\s+"
@@ -203,6 +245,21 @@ def parse_machine_fall_line(line: str):
         "fall_alt": fall_alt,
     }
 
+def parse_imu_csv(line: str):
+    parts = [p.strip() for p in line.split(",")]
+    if len(parts) != 8:
+        print(line)
+        return None
+    try:
+        return {
+            "t_ms": int(parts[0]),
+            "ax": float(parts[1]), "ay": float(parts[2]), "az": float(parts[3]),
+            "gx": float(parts[4]), "gy": float(parts[5]), "gz": float(parts[6]),
+            "fall_alt": float(parts[7]),
+        }
+    except ValueError:
+        return None
+
 
 # ========================= Reminder State ========================
 @dataclass
@@ -219,13 +276,13 @@ class PendingAlert:
 PENDING_LOCK = threading.Lock()
 PENDING_ALERTS: dict[int, PendingAlert] = {}
 
-def start_reminder_loop(chat_id: int, message_id: int, original_text: str, base_lying_s:int):
+def start_reminder_loop(chat_id: int, message_id: int, original_text: str, base_lying_s: int, created_ts: float | None = None):
     cancel_event = threading.Event()
     alert = PendingAlert(
         chat_id=chat_id,
         original_message_id=message_id,
         original_text=original_text,
-        created_ts=time.time(),
+        created_ts=(created_ts if created_ts is not None else time.time()),
         cancel_event=cancel_event,
         base_lying_s=base_lying_s,
         reminder_count=0,
@@ -248,15 +305,15 @@ def start_reminder_loop(chat_id: int, message_id: int, original_text: str, base_
                 current = PENDING_ALERTS.get(chat_id)
                 if current is None or current.original_message_id != message_id:
                     return
+
                 current.reminder_count += 1
                 rc = current.reminder_count
                 floor_s = int(current.base_lying_s + (time.time() - current.created_ts))
 
-
             if rc > MAX_REMINDERS:
                 cancel_event.set()
                 try:
-                    send_message("⏳ No response received. Reminders stopped.")
+                    send_message("⛔ No response received. Reminders stopped.")
                 except Exception:
                     pass
                 return
@@ -264,11 +321,10 @@ def start_reminder_loop(chat_id: int, message_id: int, original_text: str, base_
             try:
                 resp = send_message(
                     f"⏰ Reminder: no response yet.\n"
-                    f"🧍 Time on floor: {floor_s} seconds\n\n"
-                    "Please select a button:\n- False Alarm\n- Contact Nic",
+                    f"🧍‍♂️Time on floor: {floor_s} seconds\n\n"
+                    "Please select a button:\n- ✅ False Alarm!\n- 🚑 Call Ambulance",
                     reply_markup=build_keyboard()
                 )
-
                 reminder_mid = resp["result"]["message_id"]
 
                 with PENDING_LOCK:
@@ -310,23 +366,30 @@ def resolve_pending_alert(chat_id: int, resolution_text: str):
 
     return alert
 
+
+# ========================= TELEGRAM UPDATES LOOP ========================
 def telegram_updates_loop():
     offset = None
+    backoff = 1.0   # ← ADD THIS LINE (before while True)
+
     while True:
         params = {"timeout": 30}
         if offset is not None:
             params["offset"] = offset
 
         try:
-            r = requests.get(f"{API}/getUpdates", params=params, timeout=35)
+            r = SESSION.get(f"{API}/getUpdates", params=params, timeout=35)
+            backoff = 1.0  # reset backoff after success
+
         except Exception as e:
             print("getUpdates network error:", e)
-            time.sleep(1)
+            time.sleep(backoff + random.uniform(0, 0.25))
+            backoff = min(backoff * 2, 30.0)  # exponential backoff (max 30s)
             continue
 
         if not r.ok:
-            print("getUpdates failed:", r.status_code, r.text)
-            time.sleep(1)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
             continue
 
         updates = r.json().get("result", [])
@@ -376,31 +439,17 @@ def telegram_updates_loop():
                 except Exception:
                     pass
 
-            elif data == "contact_nic":
-                resolve_pending_alert(chat_id, f"📞 User requested contact. Call: {NIC_NUMBER}")
+            elif data == "call_ambulance":
+                resolve_pending_alert(chat_id, f"🚑 User requested contact. Call: {AMBULANCE_NUMBER}")
                 try:
-                    send_message(f"📞 Call this number to contact Nic: {NIC_NUMBER}")
+                    send_message(f"🚑 Call the Ambulance: {AMBULANCE_NUMBER}")
                 except Exception:
                     pass
 
         time.sleep(0.1)
 
-# ================= UART + Video pipeline =================
-def parse_imu_csv(line: str):
-    parts = [p.strip() for p in line.split(",")]
-    if len(parts) != 8:
-        print(line)
-        return None
-    try:
-        return {
-            "t_ms": int(parts[0]),
-            "ax": float(parts[1]), "ay": float(parts[2]), "az": float(parts[3]),
-            "gx": float(parts[4]), "gy": float(parts[5]), "gz": float(parts[6]),
-            "fall_alt": float(parts[7])
-        }
-    except ValueError:
-        return None
 
+# ================= UART + Video pipeline =================
 def write_buffer_to_csv(rows, out_path: Path):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", newline="", encoding="utf-8") as f:
@@ -420,14 +469,22 @@ def run_postprocess(csv_file: Path):
         )
         print(f"Frames saved -> {frames_dir}")
 
-        subprocess.run(
-            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats", "-y", "-framerate", "25",
-             "-i", str(frames_dir / "frame_%03d.png"),
-             "-c:v", "libx264", "-pix_fmt", "yuv420p", str(mp4_out)],
-            check=True,
-        )
-        print(f"Rendered video -> {mp4_out}")
-        return str(mp4_out)
+        mp4_from_csvtoframes = frames_dir / "out.mp4"
+        if mp4_from_csvtoframes.exists():
+            # move/copy into videos_out with the right name
+            VIDEOS_ROOT.mkdir(parents=True, exist_ok=True)
+            mp4_out = (VIDEOS_ROOT / f"{csv_file.stem}.mp4")
+            try:
+                os.replace(mp4_from_csvtoframes, mp4_out)  # atomic move if same drive
+            except Exception:
+                import shutil
+                shutil.copy2(mp4_from_csvtoframes, mp4_out)
+            print(f"Rendered video -> {mp4_out}")
+            return str(mp4_out)
+
+        print("Video postprocess failed: out.mp4 not found")
+        return None
+
     except Exception as e:
         print("Video postprocess failed:", e)
         return None
@@ -444,7 +501,9 @@ def uart_loop():
     capturing_post = False
 
     port = auto_detect_port()
-    ser = serial.Serial(port, BAUD, timeout=TIMEOUT_S)
+    global SER
+    SER = serial.Serial(port, BAUD, timeout=TIMEOUT_S)
+    ser = SER
     print(f"Listening on {ser.port} @ {BAUD}...")
 
     last_video_path = None
@@ -467,7 +526,10 @@ def uart_loop():
                 post_trigger_buffer.append(sample)
 
                 enough = (len(post_trigger_buffer) >= post_trigger_samples_needed)
-                timed_out = (post_capture_started_ts is not None and (time.time() - post_capture_started_ts) >= POST_CAPTURE_TIMEOUT_S)
+                timed_out = (
+                    post_capture_started_ts is not None
+                    and (time.time() - post_capture_started_ts) >= POST_CAPTURE_TIMEOUT_S
+                )
 
                 if enough or timed_out:
                     combined = list(buf) + post_trigger_buffer
@@ -490,8 +552,16 @@ def uart_loop():
                         except Exception as e:
                             print("Video upload failed (delayed):", e)
                         pending_video_upload = False
+                        
+                        global pending_reminder_start
+                        if pending_reminder_start is not None:
+                            chat_id, message_id, alert_text, base_lying, alert_created_ts = pending_reminder_start
+                            start_reminder_loop(chat_id, message_id, alert_text, base_lying, created_ts=alert_created_ts)
+                            pending_reminder_start = None
+
             continue  # important: don't treat IMU lines as triggers
-        
+
+        # Assist text trigger
         if ASSIST_TEXT in line:
             now = time.time()
             if now - last_telegram_sent >= TELEGRAM_COOLDOWN_S:
@@ -539,7 +609,6 @@ def uart_loop():
                 message_id = resp["result"]["message_id"]
                 base_lying = fall_info["lying_s"] or 0
                 start_reminder_loop(chat_id, message_id, alert_text, base_lying)
-
             except Exception as e:
                 print("Failed to start reminder loop (ignored):", e)
 
@@ -553,6 +622,7 @@ def uart_loop():
                 pending_video_upload = True
 
             last_telegram_sent = now
+
 
 def main():
     t = threading.Thread(target=telegram_updates_loop, daemon=True)

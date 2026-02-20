@@ -11,7 +11,7 @@ import trimesh
 import pyrender
 from scipy.spatial.transform import Rotation as R
 
-W, H = 512, 512
+W, H = 384, 384
 
 def load_trimesh_obj(path: Path) -> trimesh.Trimesh:
     tm = trimesh.load(str(path), force="mesh")
@@ -84,12 +84,15 @@ def main(csv_path, out_dir):
     r = pyrender.OffscreenRenderer(viewport_width=W, viewport_height=H)
 
     rows = load_rows(Path(csv_path))
+    fps = 60
+    out_path = out_dir / "out.mp4"
+    writer = imageio.get_writer(out_path, fps=fps, codec="libx264", quality=8)
 
     R_cur = R.identity()
     for i in range(len(rows)):
         dt = 0.0 if i == 0 else (rows[i]["t_ms"] - rows[i-1]["t_ms"]) / 1000.0
-        angle_deg = np.array([rows[i]["gx"], rows[i]["gy"], rows[i]["gz"]]) * dt
-        dR = R.from_euler("xyz", angle_deg, degrees=True)
+        angle_rad = np.deg2rad(np.array([rows[i]["gx"], rows[i]["gy"], rows[i]["gz"]]) * dt)
+        dR = R.from_rotvec(angle_rad)
         R_cur = dR * R_cur
 
         # pose for pyrender node (4x4)
@@ -97,10 +100,14 @@ def main(csv_path, out_dir):
         pose[:3, :3] = R_cur.as_matrix()
         scene.set_pose(mesh_node, pose=pose)  # Scene can update node pose
 
-        color, depth = r.render(scene)  # returns image arrays
-        imageio.imwrite(out_dir / f"frame_{i:03d}.png", color)
+        #color, depth = r.render(scene)  # returns image arrays
+        color, _ = r.render(scene)
+        writer.append_data(color)
+        #imageio.imwrite(out_dir / f"frame_{i:03d}.png", color)
 
+    writer.close()
     r.delete()
+    print(f"Video saved -> {out_path}")
 
 if __name__ == "__main__":
     main(sys.argv[1], sys.argv[2])

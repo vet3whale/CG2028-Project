@@ -7,6 +7,7 @@
 /*--------------------------- Includes ---------------------------------------*/
 #include <math.h>
 #include "stdio.h"
+#include <stdbool.h>
 #include "string.h"
 #include <sys/stat.h>
 
@@ -15,7 +16,11 @@
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_psensor.h"
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_gyro.h"
 
+UART_HandleTypeDef huart1;
 
+/*----------------------------- Buzzer Pins --------------------------------- */
+#define BUZZ_GPIO_Port GPIOB
+#define BUZZ_Pin GPIO_PIN_3
 
 /*--------------------------- Helper Functions ------------------------------*/
 static inline float absf(float x) {
@@ -113,22 +118,139 @@ static uint8_t latched_rot = 0;
 static uint8_t latched_jerk = 0;
 static float latched_a_mag = 0.0f;
 
+
 /*--------------------------- Forward Declarations ---------------------------------------*/
 static void UART1_Init(void);
 extern void initialise_monitor_handles(void);
 extern int mov_avg(int N, int* accel_buff);
 static void process_axis_transition(uint32_t now, int top1_axis, char current_sign, float base_pressure, float filtered_pressure);
 
-// ============== UART Peripherals =========================
-UART_HandleTypeDef huart1;
+/* ------------------------- UART RX line buffer + parser ---------------------------*/
+static uint8_t rx_byte;
+static char rx_line[64];
+static uint16_t rx_idx = 0;
 
+typedef enum {
+  PAT_NONE = 0,
+  PAT_FA,
+  PAT_995
+} pattern_t;
+
+static volatile pattern_t pending_pat = PAT_NONE;
+
+static void handle_cmd(const char *line)
+{
+  // expected: "BEEP FA" or "BEEP 995"
+  if (strncmp(line, "BEEP", 4) != 0) return;
+
+  if (strstr(line, "FA") != NULL) {
+    pending_pat = PAT_FA;
+  } else if (strstr(line, "995") != NULL) {
+    pending_pat = PAT_995;
+  }
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == huart1.Instance) {   // ✅ huart1 not huart2
+    char c = (char)rx_byte;
+
+    if (c == '\n' || c == '\r') {
+      if (rx_idx > 0) {
+        rx_line[rx_idx] = '\0';
+        handle_cmd(rx_line);
+        rx_idx = 0;
+      }
+    } else {
+      if (rx_idx < (sizeof(rx_line) - 1)) {
+        rx_line[rx_idx++] = c;
+      } else {
+        rx_idx = 0;
+      }
+    }
+
+    HAL_UART_Receive_IT(&huart1, &rx_byte, 1);  // ✅ re-arm RX on huart1
+  }
+}
+
+typedef struct {
+  bool active;
+  pattern_t pat;
+  uint8_t step;
+  uint32_t next_ms;
+} buzzer_t;
+
+static buzzer_t bz = {0};
+
+static void buzz_on(void)  { HAL_GPIO_WritePin(BUZZ_GPIO_Port, BUZZ_Pin, GPIO_PIN_SET); }
+static void buzz_off(void) { HAL_GPIO_WritePin(BUZZ_GPIO_Port, BUZZ_Pin, GPIO_PIN_RESET); }
+static void BUZZ_Init(void)
+{
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Pin = BUZZ_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(BUZZ_GPIO_Port, &GPIO_InitStruct);
+
+    buzz_off();
+}
+
+static void buzzer_start(pattern_t p)
+{
+  bz.active = true;
+  bz.pat = p;
+  bz.step = 0;
+  bz.next_ms = HAL_GetTick();
+}
+
+static void buzzer_update(void)
+{
+  if (!bz.active) return;
+
+  uint32_t now = HAL_GetTick();
+  if ((int32_t)(now - bz.next_ms) < 0) return;
+
+  // if false alarm pressed then this pattern
+  if (bz.pat == PAT_FA) {
+    switch (bz.step) {
+      case 0: buzz_on();  bz.next_ms = now + 120; bz.step++; break;
+      case 1: buzz_off(); bz.next_ms = now + 120; bz.step++; break;
+      case 2: buzz_on();  bz.next_ms = now + 120; bz.step++; break;
+      case 3: buzz_off(); bz.active = false; break;
+      default: buzz_off(); bz.active = false; break;
+    }
+    return;
+  }
+
+  // if call 995 pressed then this pattern
+  if (bz.pat == PAT_995) {
+    switch (bz.step) {
+      case 0: buzz_on();  bz.next_ms = now + 600; bz.step++; break;
+      case 1: buzz_off(); bz.next_ms = now + 150; bz.step++; break;
+      case 2: buzz_on();  bz.next_ms = now + 600; bz.step++; break;
+      case 3: buzz_off(); bz.next_ms = now + 150; bz.step++; break;
+      case 4: buzz_on();  bz.next_ms = now + 900; bz.step++; break;
+      case 5: buzz_off(); bz.active = false; break;
+      default: buzz_off(); bz.active = false; break;
+    }
+    return;
+  }
+
+  buzz_off();
+  bz.active = false;
+}
+
+// ============== UART Peripherals =========================
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
   if (GPIO_Pin == USER_BUTTON_PIN)
   {
-	  char buffer[150];
-	  sprintf(buffer, "Not a False Alarm! User needs assistance!\r\n");
-	  HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+          char buffer[150];
+          sprintf(buffer, "Not a False Alarm! User needs assistance!\r\n");
+          HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
   }
 }
 
@@ -138,7 +260,9 @@ int main(void)
     const int N = 4;
 
     HAL_Init();
+    BUZZ_Init();
     UART1_Init();
+    HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
 
     BSP_LED_Init(LED2);
     BSP_ACCELERO_Init();
@@ -158,29 +282,29 @@ int main(void)
 
     float total_base_pressure = 0;
 
-	char buffer[150];
-	sprintf(buffer, "Stand up straight and wear the device\r\n");
-	HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+        char buffer[150];
+        sprintf(buffer, "Stand up straight and wear the device\r\n");
+        HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 
-	HAL_Delay(3000);
+        HAL_Delay(3000);
 
-	sprintf(buffer, "Calibrating Barometer... Keep the board stationary\r\n");
+        sprintf(buffer, "Calibrating Barometer... Keep the board stationary\r\n");
     HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
-	for (int i = 0; i < BARO_COUNT; i++) {
-		total_base_pressure += BSP_PSENSOR_ReadPressure();
-	}
+        for (int i = 0; i < BARO_COUNT; i++) {
+                total_base_pressure += BSP_PSENSOR_ReadPressure();
+        }
 
-	float base_pressure = total_base_pressure / BARO_COUNT;
-	sprintf(buffer, "Calibration done!\r\n");
-	HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
-	total_base_pressure = 0;
+        float base_pressure = total_base_pressure / BARO_COUNT;
+        sprintf(buffer, "Calibration done!\r\n");
+        HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+        total_base_pressure = 0;
 
-	float filtered_pressure = base_pressure;
-	float current_altitude = 0.0f;
+        float filtered_pressure = base_pressure;
+        float current_altitude = 0.0f;
 
-	int baro_count = 0;
+        int baro_count = 0;
 
-	while (!stop_loop)
+        while (!stop_loop)
     {
         int16_t accel_data_i16[3] = {0};
         BSP_ACCELERO_AccGetXYZ(accel_data_i16);
@@ -223,12 +347,19 @@ int main(void)
         /***************************UART transmission*******************************************/
         uint32_t now = HAL_GetTick();
 
+        // ✅ if telegram pressed a button, play the correct pattern
+        if (pending_pat != PAT_NONE) {
+            buzzer_start(pending_pat);
+            pending_pat = PAT_NONE;
+        }
+        buzzer_update();
+
         // ********* Fall detection: free-fall -> confirm by impact/rotation/orientation-change *********
         uint32_t t_ms = HAL_GetTick();
         sprintf(buffer, "%lu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\r\n",
                 t_ms,
-        		accel_filt_asm[0], accel_filt_asm[1], accel_filt_asm[2],
-				gyro_velocity[0], gyro_velocity[1], gyro_velocity[2], current_altitude);
+                        accel_filt_asm[0], accel_filt_asm[1], accel_filt_asm[2],
+                                gyro_velocity[0], gyro_velocity[1], gyro_velocity[2], current_altitude);
         HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 
         // ********* Rotation/orientation trigger: dominant axis switch (X<->Y<->Z) *********
@@ -261,17 +392,17 @@ int main(void)
         uint8_t sudden_action = (sudden_rot || sudden_jerk);
 
         if (sudden_action && a_mag >= TRIGGER_A_MIN) {
-			impact_latched = 1;
-			impact_time_ms = now;
-			latched_rot = sudden_rot;
-			latched_jerk = sudden_jerk;
-			latched_a_mag = a_mag;
-		}
+                        impact_latched = 1;
+                        impact_time_ms = now;
+                        latched_rot = sudden_rot;
+                        latched_jerk = sudden_jerk;
+                        latched_a_mag = a_mag;
+                }
 
-		// expire the latch if the board doesnt settle into a new axis within 1.5 seconds
-		if (impact_latched && (now - impact_time_ms) > 1500) {
-			impact_latched = 0;
-		}
+                // expire the latch if the board doesnt settle into a new axis within 1.5 seconds
+                if (impact_latched && (now - impact_time_ms) > 1500) {
+                        impact_latched = 0;
+                }
 
         // only consider orientation when magnitude is near 1g
         uint8_t stable_1g = (a_mag >= G_STABLE_MIN && a_mag <= G_STABLE_MAX);
@@ -298,7 +429,7 @@ int main(void)
         {
             float raw_vals[] = {ax, ay, az};
             char current_sign = (raw_vals[top1_axis] >= 0) ? '+' : '-';
-        	if (!prev_axis_valid) // runs once at init
+                if (!prev_axis_valid) // runs once at init
             {
                 prev_axis = top1_axis;
                 prev_sign = current_sign;
@@ -376,12 +507,12 @@ static void process_axis_transition(uint32_t now, int top1_axis, char current_si
             // ----- Telegram machine-readable line -----
             float raw_pressure = BSP_PSENSOR_ReadPressure();
             filtered_pressure = PRESSURE_EMA_ALPHA * raw_pressure +
-								(1.0f - PRESSURE_EMA_ALPHA) * filtered_pressure;
-			float current_altitude = 44330.0f * (1.0f - powf(filtered_pressure / base_pressure, 0.190295f));
+                                                                (1.0f - PRESSURE_EMA_ALPHA) * filtered_pressure;
+                        float current_altitude = 44330.0f * (1.0f - powf(filtered_pressure / base_pressure, 0.190295f));
 
             float peak_g = latched_a_mag / G_NORM;   // latched_a_mag is in m/s^2 in his code
             sprintf(buffer, "FALL axis=%c%c -> %c%c peak_g=%.2f lying_s=%d fall_alt=%.3f\r\n",
-            		prev_sign, axes_names[prev_axis], current_sign, axes_names[top1_axis], peak_g, 5, current_altitude);
+                        prev_sign, axes_names[prev_axis], current_sign, axes_names[top1_axis], peak_g, 5, current_altitude);
             HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 
             // Use the LATCHED variables to see what caused the fall
