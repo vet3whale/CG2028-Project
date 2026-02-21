@@ -25,6 +25,7 @@ BAUD = 115200
 TIMEOUT_S = 1
 
 SER = None
+SER_LOCK = threading.Lock()
 
 BOT_TOKEN = "8463120288:AAEjTsTXQ1YChPB53w92LNjCf_6rKWwlPJo"
 CHAT_ID = "-1003576715549"  # supergroup chat id
@@ -119,13 +120,19 @@ def get_ser():
     return SER
 
 def send_to_stm32(cmd: str):
+    global SER
     try:
-        s = get_ser()
-        s.write((cmd.strip() + "\n").encode("utf-8"))
-        s.flush()
+        if SER is None or not SER.is_open:
+            raise RuntimeError("Serial not open")
+
+        data = (cmd.strip() + "\n").encode("utf-8")
+        with SER_LOCK:
+            SER.write(data)
+            SER.flush()
         print("Sent:", cmd)
     except Exception as e:
         print("Failed to send to STM32:", e)
+
 
 # ========================= TELEGRAM HELPERS ========================
 def _tg_post(method: str, *, data=None, files=None, timeout=15):
@@ -248,7 +255,6 @@ def parse_machine_fall_line(line: str):
 def parse_imu_csv(line: str):
     parts = [p.strip() for p in line.split(",")]
     if len(parts) != 8:
-        print(line)
         return None
     try:
         return {
@@ -434,6 +440,7 @@ def telegram_updates_loop():
 
             if data == "false_alarm":
                 resolve_pending_alert(chat_id, "✅ User pressed False Alarm. No action will be done.")
+                send_to_stm32("BEEP FA")
                 try:
                     send_message("✅ Acknowledged: False alarm.")
                 except Exception:
@@ -441,6 +448,7 @@ def telegram_updates_loop():
 
             elif data == "call_ambulance":
                 resolve_pending_alert(chat_id, f"🚑 User requested contact. Call: {AMBULANCE_NUMBER}")
+                send_to_stm32("BEEP 995")
                 try:
                     send_message(f"🚑 Call the Ambulance: {AMBULANCE_NUMBER}")
                 except Exception:
@@ -500,12 +508,11 @@ def uart_loop():
     post_trigger_buffer = []
     capturing_post = False
 
-    port = auto_detect_port()
     global SER
-    SER = serial.Serial(port, BAUD, timeout=TIMEOUT_S)
     ser = SER
     print(f"Listening on {ser.port} @ {BAUD}...")
-
+    time.sleep(5)
+    send_to_stm32("BEEP FA")
     last_video_path = None
 
     while True:
@@ -574,6 +581,7 @@ def uart_loop():
         is_data_trigger = ("FALL axis=" in line)
 
         if not (is_video_trigger or is_data_trigger):
+            print("[STM32]", line)
             continue
 
         print("Trigger line:", line)
@@ -625,9 +633,33 @@ def uart_loop():
 
 
 def main():
+    global SER
+    port = auto_detect_port()
+    SER = serial.Serial(port, BAUD, timeout=TIMEOUT_S)
+
     t = threading.Thread(target=telegram_updates_loop, daemon=True)
     t.start()
-    uart_loop()
+
+    try:
+        uart_loop()   # blocking loop
+    except KeyboardInterrupt:
+        print("\nCtrl-C received, exiting...")
+    finally:
+        # Close serial if open
+        try:
+            if SER is not None and SER.is_open:
+                SER.close()
+        except Exception:
+            pass
+
+        # Close HTTP session (free sockets)
+        try:
+            SESSION.close()
+        except Exception:
+            pass
+
+        print("Shutdown complete.")
+
 
 if __name__ == "__main__":
     main()
