@@ -37,23 +37,27 @@ typedef enum {
 /*--------------------------- Constants ---------------------------------------*/
 #define G_NORM                  9.8f
 #define SAMPLE_PERIOD_MS        20
-#define UART_PRINT_PERIOD_MS    300
 #define G_STABLE_MIN            7.0f
 #define G_STABLE_MAX            12.5f
+
 #define DOM_AXIS_FRAC_MIN       0.55f
 #define AXIS_SWITCH_MARGIN_FRAC 0.10f
+
 #define ORIENT_DEBOUNCE_MS      150
 #define ORIENT_COOLDOWN_MS      400
+
 #define SUDDEN_GYRO_DPS_MIN     220.0f
 #define SUDDEN_JERK_MIN         2.5f
+
 #define TRIGGER_A_MIN           12.0f
 #define PRESSURE_EMA_ALPHA      0.15f
+
 #define BARO_COUNT              100
 #define SAMPLING_COUNT          1
+
 #define NORMAL_TOGGLE_MS        500
 #define FAST_TOGGLE_MS          100
 #define FAST_BLINK_HOLD_MS      3000
-#define END_AFTER_MS            4000
 
 /*--------------------------- Module State ---------------------------------------*/
 static fall_state_t fall_state = FALL_NORMAL;
@@ -90,7 +94,7 @@ static void process_axis_transition(uint32_t now, int top1_axis,
 static void buzzer_update(void);
 
 /* ====================== UART RX (verified pattern) ======================== */
-static uint8_t rx_buf[64];          // HAL fills this via ReceiveToIdle_IT
+static uint8_t rx_buf[64]; // HAL fills this via ReceiveToIdle_IT
 
 typedef enum {
     PAT_NONE = 0, PAT_FA, PAT_995, PAT_HELP
@@ -166,10 +170,6 @@ static void buzzer_update(void) {
     uint32_t now = HAL_GetTick();
     if ((int32_t)(now - bz.next_ms) < 0) return;
 
-    char buffer[150];
-    sprintf(buffer, "Playing Buzzer now...\r\n");
-    HAL_UART_Transmit(&huart1, (uint8_t *)buffer, strlen(buffer), HAL_MAX_DELAY);
-
     if (bz.pat == PAT_FA) {
         switch (bz.step) {
             case 0: buzz_on();  bz.next_ms = now + 120; bz.step++; break;
@@ -180,6 +180,7 @@ static void buzzer_update(void) {
         }
         return;
     }
+
     if (bz.pat == PAT_995) {
         switch (bz.step) {
             case 0: buzz_on();  bz.next_ms = now + 600; bz.step++; break;
@@ -194,20 +195,37 @@ static void buzzer_update(void) {
     }
 
     if (bz.pat == PAT_HELP) {
-		switch (bz.step) {
-			case 0: buzz_on();  bz.next_ms = now + 200; bz.step++; break;
-			case 1: buzz_off(); bz.next_ms = now + 100; bz.step++; break;
-			case 2: buzz_on();  bz.next_ms = now + 200; bz.step++; break;
-			case 3: buzz_off(); bz.next_ms = now + 100; bz.step++; break;
-			case 4: buzz_on();  bz.next_ms = now + 400; bz.step++; break;
-			case 5: buzz_off(); bz.active = false; break;
-			default: buzz_off(); bz.active = false; break;
-		}
-		return;
+        switch (bz.step) {
+            // S · · ·
+            case 0:  buzz_on();  bz.next_ms = now + 150; bz.step++; break;
+            case 1:  buzz_off(); bz.next_ms = now + 100; bz.step++; break;
+            case 2:  buzz_on();  bz.next_ms = now + 150; bz.step++; break;
+            case 3:  buzz_off(); bz.next_ms = now + 100; bz.step++; break;
+            case 4:  buzz_on();  bz.next_ms = now + 150; bz.step++; break;
+            case 5:  buzz_off(); bz.next_ms = now + 200; bz.step++; break;
+            // O — — —
+            case 6:  buzz_on();  bz.next_ms = now + 400; bz.step++; break;
+            case 7:  buzz_off(); bz.next_ms = now + 100; bz.step++; break;
+            case 8:  buzz_on();  bz.next_ms = now + 400; bz.step++; break;
+            case 9:  buzz_off(); bz.next_ms = now + 100; bz.step++; break;
+            case 10: buzz_on();  bz.next_ms = now + 400; bz.step++; break;
+            case 11: buzz_off(); bz.next_ms = now + 200; bz.step++; break;
+            // S · · ·
+            case 12: buzz_on();  bz.next_ms = now + 150; bz.step++; break;
+            case 13: buzz_off(); bz.next_ms = now + 100; bz.step++; break;
+            case 14: buzz_on();  bz.next_ms = now + 150; bz.step++; break;
+            case 15: buzz_off(); bz.next_ms = now + 100; bz.step++; break;
+            case 16: buzz_on();  bz.next_ms = now + 150; bz.step++; break;
+            case 17: buzz_off(); bz.active = false; break;
+            default: buzz_off(); bz.active = false; break;
+        }
+        return;
     }
+
     buzz_off();
     bz.active = false;
 }
+
 
 /* ========================= Button callback ================================ */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
