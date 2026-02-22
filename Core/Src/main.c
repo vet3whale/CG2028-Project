@@ -93,7 +93,7 @@ static void buzzer_update(void);
 static uint8_t rx_buf[64];          // HAL fills this via ReceiveToIdle_IT
 
 typedef enum {
-    PAT_NONE = 0, PAT_FA, PAT_995
+    PAT_NONE = 0, PAT_FA, PAT_995, PAT_HELP
 } pattern_t;
 
 volatile pattern_t buzzer_req = PAT_NONE;
@@ -192,6 +192,19 @@ static void buzzer_update(void) {
         }
         return;
     }
+
+    if (bz.pat == PAT_HELP) {
+		switch (bz.step) {
+			case 0: buzz_on();  bz.next_ms = now + 200; bz.step++; break;
+			case 1: buzz_off(); bz.next_ms = now + 100; bz.step++; break;
+			case 2: buzz_on();  bz.next_ms = now + 200; bz.step++; break;
+			case 3: buzz_off(); bz.next_ms = now + 100; bz.step++; break;
+			case 4: buzz_on();  bz.next_ms = now + 400; bz.step++; break;
+			case 5: buzz_off(); bz.active = false; break;
+			default: buzz_off(); bz.active = false; break;
+		}
+		return;
+    }
     buzz_off();
     bz.active = false;
 }
@@ -202,6 +215,10 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
         char buffer[150];
         sprintf(buffer, "Not a False Alarm! User needs assistance!\r\n");
         HAL_UART_Transmit(&huart1, (uint8_t *)buffer, strlen(buffer), HAL_MAX_DELAY);
+		bz.pat = PAT_HELP; // Interrupt function so just arm the buzzer, main() will play buzzer
+		bz.step = 0;
+		bz.next_ms = HAL_GetTick();
+		bz.active = true;
     }
 }
 
