@@ -1,3 +1,4 @@
+# ========== This is a serial handshake test between PC and STM32 ==========
 import serial
 import time
 from serial.tools import list_ports
@@ -5,6 +6,7 @@ from serial.tools import list_ports
 PORT = "COM3"
 BAUD = 115200
 
+# Auto detects the port
 def auto_detect_port() -> str:
     ports = list_ports.comports()
     for p in ports:
@@ -17,6 +19,7 @@ def auto_detect_port() -> str:
         return ports[0].device
     raise RuntimeError("No serial ports found.")
 
+# Sends a line of tet to STM32
 def send(ser, msg):
     ser.write((msg.strip() + "\n").encode("utf-8"))
     ser.flush()
@@ -46,7 +49,7 @@ def main():
             send(ser, "ACK: Python ready")
             break  # move on to sending data
 
-    # Small gap before sending data
+    # Small gap before sending data to prevent overlapping UART message
     time.sleep(0.5)
 
     # Step 3: Send actual data

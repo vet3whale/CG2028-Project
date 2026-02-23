@@ -19,31 +19,29 @@ from datetime import datetime
 from pathlib import Path
 from serial.tools import list_ports
 
-# ===================== CONFIG =====================
+# ===================== CONFIG =============================
 PORT = "COM3"
-BAUD = 115200
-TIMEOUT_S = 1
+BAUD = 115200 # Match STM32 baud rate
+TIMEOUT_S = 1 # how long to wait before readline() return empty
 
+# Ensure UART and telegram dont write to serial simultaneously
 SER = None
-SER_LOCK = threading.Lock()
+SER_LOCK = threading.Lock() 
 
+# ========================= TELEGRAM ========================
 BOT_TOKEN = "8463120288:AAEjTsTXQ1YChPB53w92LNjCf_6rKWwlPJo"
-CHAT_ID = "-1003576715549"  # supergroup chat id
-
+CHAT_ID = "-1003576715549"  # supergroup
 AMBULANCE_NUMBER = "995"
 
-# How many IMU samples to keep for video
-SAMPLE_RATE = 50
-CLIP_SECONDS = 3
-BUFFER_LEN = SAMPLE_RATE * CLIP_SECONDS
+# Cooldown to avoid spam 
+TELEGRAM_COOLDOWN_S = 1
 
-# NOTE: Unused in current logic, kept for reference.
-TRIGGER_TEXTS = [
-    "FALL DETECTED",
-    "!!! FALL DETECTED !!!",
-    "FALL axis=",
-]
+# Telegram cooldown so you don't spam initial alerts
+ASSIST_TEXT = "Not a False Alarm! User needs assistance!"
+assist_last_seen_ts = 0.0
+ASSIST_MIN_INTERVAL = 1.0
 
+# ================== REQ SESSION + RETRIES =====================
 SESSION = requests.Session()
 _retry = Retry(
     total=5,
@@ -59,14 +57,19 @@ adapter = HTTPAdapter(max_retries=_retry, pool_connections=10, pool_maxsize=10)
 SESSION.mount("https://", adapter)
 SESSION.mount("http://", adapter)
 
-ASSIST_TEXT = "Not a False Alarm! User needs assistance!"
+# ===================== IMU Buffering ===========================
+SAMPLE_RATE = 50
+CLIP_SECONDS = 3
+BUFFER_LEN = SAMPLE_RATE * CLIP_SECONDS
+POST_CAPTURE_TIMEOUT_S = 2.0  # finalize even if we don't get enough samples
 
-# Where to save outputs
+# Output folders
 ROOT = Path(__file__).parent
 OUTPUT_DIR = ROOT / "captures"
 FRAMES_ROOT = ROOT / "frames_out"
 VIDEOS_ROOT = ROOT / "videos_out"
 
+# CSV to Frames resolver
 CSV_TO_FRAMES_CANDIDATES = [
     ROOT / "csvToFrames.py",
     ROOT / "csvtoframes.py",
@@ -76,30 +79,24 @@ CSV_TO_FRAMES = next(
     CSV_TO_FRAMES_CANDIDATES[0],
 )
 
-# CSV format from STM32 stream
+# STM32 CSV format (for frame + video visualisation)
 FIELDNAMES = ["t_ms", "ax", "ay", "az", "gx", "gy", "gz", "fall_alt"]
 
-# Telegram cooldown so you don't spam initial alerts
-TELEGRAM_COOLDOWN_S = 1
-assist_last_seen_ts = 0.0
-ASSIST_MIN_INTERVAL = 1.0
-
-# ===== Reminder settings =====
+# ======================= REMINDERS =========================
 REMIND_EVERY_SECONDS = 15
 MAX_REMINDERS = 999999
 
-POST_CAPTURE_TIMEOUT_S = 2.0  # finalize even if we don't get enough samples
-
-# ===================== RUNTIME STATE =====================
+# ===================== RUNTIME STATE =======================
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 last_telegram_sent = 0.0
 
-post_capture_started_ts = None
+post_capture_started_ts = None # timeout post trigger capture
 pending_video_upload = False  # set True when we send alert but mp4 not ready yet
-pending_reminder_start = None
+pending_reminder_start = None 
 
 
 # ========================= PORT DETECTION =======================
+# If any port description match USB or STM then pick that one
 def auto_detect_port() -> str:
     ports = list_ports.comports()
     for p in ports:
@@ -115,12 +112,14 @@ def auto_detect_port() -> str:
     raise RuntimeError("No serial ports found.")
 
 # ======================= STM32 Buzzer Helpers ========================
+# Check that serial SER exists and is open
 def get_ser():
     global SER
     if SER is None or not SER.is_open:
         raise RuntimeError("Serial not initialized yet. uart_loop() must start first.")
     return SER
 
+# Write command to STM32 via UART
 def send_to_stm32(cmd: str):
     global SER
     try:
@@ -128,7 +127,7 @@ def send_to_stm32(cmd: str):
             raise RuntimeError("Serial not open")
 
         data = (cmd.strip() + "\n").encode("utf-8")
-        with SER_LOCK:
+        with SER_LOCK: # to prevent write collisions between Telegram and UART thread
             SER.write(data)
             SER.flush()
         print("Sent:", cmd)
@@ -137,6 +136,7 @@ def send_to_stm32(cmd: str):
 
 
 # ========================= TELEGRAM HELPERS ========================
+# Telegram POST wrapper (send message/video, editMessagae, etc)
 def _tg_post(method: str, *, data=None, files=None, timeout=15):
     url = f"{API}/{method}"
     r = SESSION.post(url, data=data, files=files, timeout=timeout)
@@ -145,6 +145,7 @@ def _tg_post(method: str, *, data=None, files=None, timeout=15):
         r.raise_for_status()
     return r.json()
 
+# Telegram GET wrapper (ie getUpdates)
 def _tg_get(method: str, *, params=None, timeout=35):
     url = f"{API}/{method}"
     r = SESSION.get(url, params=params, timeout=timeout)
@@ -152,6 +153,7 @@ def _tg_get(method: str, *, params=None, timeout=35):
         print(f"Telegram {method} failed:", r.status_code, r.text)
     return r
 
+# Send telegram message to CHATID
 def send_message(text: str, reply_markup=None):
     payload = {"chat_id": CHAT_ID, "text": text}
     if reply_markup is not None:
@@ -161,6 +163,7 @@ def send_message(text: str, reply_markup=None):
     print("✅ Telegram message sent!")
     return resp
 
+# Send video to CHATID
 def send_video(video_path: str, caption: str | None = None):
     with open(video_path, "rb") as f:
         files = {"video": f}
@@ -170,6 +173,7 @@ def send_video(video_path: str, caption: str | None = None):
 
         return _tg_post("sendVideo", data=data, files=files, timeout=60)
 
+#  Modify message when button clicked
 def edit_message_text(chat_id: int, message_id: int, text: str, reply_markup=None):
     payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
     if reply_markup is not None:
@@ -179,6 +183,7 @@ def edit_message_text(chat_id: int, message_id: int, text: str, reply_markup=Non
 
     return _tg_post("editMessageText", data=payload, timeout=15)
 
+# Make button void if expired
 def edit_message_reply_markup(chat_id: int, message_id: int, reply_markup=None):
     payload = {"chat_id": chat_id, "message_id": message_id}
     if reply_markup is not None:
@@ -193,6 +198,7 @@ def edit_message_reply_markup(chat_id: int, message_id: int, reply_markup=None):
         print("Telegram editMessageReplyMarkup failed:", e)
         return None
 
+# Delete reminder message
 def delete_message(chat_id: int, message_id: int) -> bool:
     try:
         _tg_post("deleteMessage", data={"chat_id": chat_id, "message_id": message_id}, timeout=15)
@@ -201,6 +207,7 @@ def delete_message(chat_id: int, message_id: int) -> bool:
         print("Telegram deleteMessage failed:", e)
         return False
 
+# Acknowledge a button press
 def answer_callback_query(callback_query_id: str):
     try:
         _tg_post("answerCallbackQuery", data={"callback_query_id": callback_query_id}, timeout=10)
@@ -210,6 +217,7 @@ def answer_callback_query(callback_query_id: str):
 
 
 # ========================= UI BUILDERS ========================
+# Two buttons for user on telegram
 def build_keyboard():
     return {
         "inline_keyboard": [
@@ -218,6 +226,7 @@ def build_keyboard():
         ]
     }
 
+# Alert text will show the following details
 def build_alert_text(axis_change, peak_g, lying_s, fall_alt):
     return (
         "🚨 *FALL DETECTED!*\n\n"
@@ -231,6 +240,7 @@ def build_alert_text(axis_change, peak_g, lying_s, fall_alt):
 
 
 # ========================= PARSERS ========================
+# Use regex to parse fall line sent by STM32
 def parse_machine_fall_line(line: str):
     m = re.search(
         r"FALL\s+axis=([+-][XYZ])\s*->\s*([+-][XYZ])\s+"
@@ -254,6 +264,7 @@ def parse_machine_fall_line(line: str):
         "fall_alt": fall_alt,
     }
 
+# Parse STM32's CSV lines - used for frame and video generation
 def parse_imu_csv(line: str):
     parts = [p.strip() for p in line.split(",")]
     if len(parts) != 8:
@@ -270,6 +281,7 @@ def parse_imu_csv(line: str):
 
 
 # ========================= Reminder State ========================
+# Represents the active incident (when user is falling)
 @dataclass
 class PendingAlert:
     chat_id: int
@@ -284,6 +296,7 @@ class PendingAlert:
 PENDING_LOCK = threading.Lock()
 PENDING_ALERTS: dict[int, PendingAlert] = {}
 
+# Start thread that sends notification every 15 seconds and update reminder_message_ids
 def start_reminder_loop(chat_id: int, message_id: int, original_text: str, base_lying_s: int, created_ts: float | None = None):
     cancel_event = threading.Event()
     alert = PendingAlert(
@@ -346,6 +359,7 @@ def start_reminder_loop(chat_id: int, message_id: int, original_text: str, base_
     t = threading.Thread(target=worker, daemon=True)
     t.start()
 
+# Finalise alert when someone presses a telegram button
 def resolve_pending_alert(chat_id: int, resolution_text: str):
     with PENDING_LOCK:
         alert = PENDING_ALERTS.get(chat_id)
@@ -376,6 +390,7 @@ def resolve_pending_alert(chat_id: int, resolution_text: str):
 
 
 # ========================= TELEGRAM UPDATES LOOP ========================
+# Keep polling telegram for keyboard button clicks
 def telegram_updates_loop():
     offset = None
     backoff = 1.0   # ← ADD THIS LINE (before while True)
@@ -460,6 +475,7 @@ def telegram_updates_loop():
 
 
 # ================= UART + Video pipeline =================
+# Dump the IMU sample dicts to a CSV file
 def write_buffer_to_csv(rows, out_path: Path):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", newline="", encoding="utf-8") as f:
@@ -467,6 +483,7 @@ def write_buffer_to_csv(rows, out_path: Path):
         w.writeheader()
         w.writerows(rows)
 
+# Convert IMU CSV into a video file
 def run_postprocess(csv_file: Path):
     try:
         frames_dir = (FRAMES_ROOT / csv_file.stem)
@@ -502,7 +519,7 @@ def run_postprocess(csv_file: Path):
 def uart_loop():
     global last_telegram_sent, pending_video_upload, post_capture_started_ts
 
-    # Capture half pre-trigger + half post-trigger:
+    # Capture half pre-trigger + half post-trigger for a better video:
     pre_trigger_len = BUFFER_LEN // 2
     post_trigger_samples_needed = BUFFER_LEN - pre_trigger_len
 
@@ -570,7 +587,7 @@ def uart_loop():
 
             continue  # important: don't treat IMU lines as triggers
 
-        # Assist text trigger
+        # 2) Assist text trigger if its <= 1 second since last assist (prevent spam)
         if ASSIST_TEXT in line:
             now = time.time()
 
@@ -583,7 +600,7 @@ def uart_loop():
 
             continue
 
-        # 2) Trigger handling (non-CSV lines)
+        # 3) Trigger handling (based on the print statements)
         is_video_trigger = ("!!! FALL DETECTED !!!" in line) or ("FALL DETECTED" == line)
         is_data_trigger = ("FALL axis=" in line)
 
@@ -593,14 +610,14 @@ def uart_loop():
 
         print("Trigger line:", line)
 
-        # VIDEO TRIGGER: start post-capture
+        # VIDEO TRIGGER: start post-capture of frames
         if is_video_trigger:
             capturing_post = True
             post_trigger_buffer = []
             post_capture_started_ts = time.time()
             continue
 
-        # DATA TRIGGER: send Telegram
+        # DATA TRIGGER: send Telegram the message and video
         if is_data_trigger:
             fall_info = parse_machine_fall_line(line)
             if not fall_info:
@@ -642,11 +659,15 @@ def uart_loop():
 def main():
     global SER
     port = auto_detect_port()
+    
+    # open serial
     SER = serial.Serial(port, BAUD, timeout=TIMEOUT_S)
 
+    # Start telegram updates thread (daemon)
     t = threading.Thread(target=telegram_updates_loop, daemon=True)
     t.start()
 
+    # Run uart_loop till Ctrl + C detected or close requests session
     try:
         uart_loop()   # blocking loop
     except KeyboardInterrupt:

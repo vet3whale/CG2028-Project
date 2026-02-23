@@ -11,8 +11,10 @@ import trimesh
 import pyrender
 from scipy.spatial.transform import Rotation as R
 
+# Decrease resolution from 512 for faster video transmission
 W, H = 384, 384
 
+# Load and normalise 3d human model
 def load_trimesh_obj(path: Path) -> trimesh.Trimesh:
     tm = trimesh.load(str(path), force="mesh")
     if isinstance(tm, trimesh.Scene):
@@ -22,12 +24,13 @@ def load_trimesh_obj(path: Path) -> trimesh.Trimesh:
     tm.vertices /= np.max(np.linalg.norm(tm.vertices, axis=1))
     return tm
 
+# Load IMU CSV file and remap axes
 def load_rows(in_csv: Path):
     def remap(ax, ay, az):
         # X' = -Z, Y' = -X, Z' = -Y
         return ay, -az, ax
     rows = []
-    with open(in_csv, newline="", encoding="utf-8") as f:
+    with open(in_csv, newline="", encoding="utf-8") as f: # Read CSV rows for acc and gyro
         r = csv.DictReader(f)
         for row in r:
             ax, ay, az = float(row["ax"]), float(row["ay"]), float(row["az"])
@@ -53,9 +56,11 @@ def main(csv_path, out_dir):
     tm = load_trimesh_obj(Path("human.obj"))
     pr_mesh = pyrender.Mesh.from_trimesh(tm, smooth=False)
 
+    # Create 3d world and add human mesh to it
     scene = pyrender.Scene(bg_color=[0, 0, 0, 255], ambient_light=[0.2, 0.2, 0.2, 1.0])
     mesh_node = scene.add(pr_mesh)
 
+    # Camera placed top right of model
     camera = pyrender.PerspectiveCamera(yfov=np.pi / 3.0)
     cam_pos = np.array([1.5, 1.5, 2.5], dtype=float)   # top-right
     target  = np.array([0.0, 0.0, 0.0], dtype=float)
@@ -69,20 +74,22 @@ def main(csv_path, out_dir):
 
     up = np.cross(right, forward)
 
+    # Build 4x4 camera pose matrix
     cam_pose = np.eye(4, dtype=float)
     cam_pose[:3, 0] = right
     cam_pose[:3, 1] = up
     cam_pose[:3, 2] = -forward   # OpenGL camera +Z points “back”
     cam_pose[:3, 3] = cam_pos
 
+    # Add camera and light to scene
     scene.add(camera, pose=cam_pose)
-
-
     light = pyrender.DirectionalLight(color=np.ones(3), intensity=2.0)
     scene.add(light, pose=cam_pose)
 
+    # Renders the frames into memory (to combine into video)
     r = pyrender.OffscreenRenderer(viewport_width=W, viewport_height=H)
 
+    # Load rows to create mp4 video
     rows = load_rows(Path(csv_path))
     fps = 60
     out_path = out_dir / "out.mp4"
@@ -95,15 +102,14 @@ def main(csv_path, out_dir):
         dR = R.from_rotvec(angle_rad)
         R_cur = dR * R_cur
 
-        # pose for pyrender node (4x4)
+        # Updates the human model orientation in scene
         pose = np.eye(4)
         pose[:3, :3] = R_cur.as_matrix()
         scene.set_pose(mesh_node, pose=pose)  # Scene can update node pose
 
-        #color, depth = r.render(scene)  # returns image arrays
+        # Append the frame to video
         color, _ = r.render(scene)
         writer.append_data(color)
-        #imageio.imwrite(out_dir / f"frame_{i:03d}.png", color)
 
     writer.close()
     r.delete()
