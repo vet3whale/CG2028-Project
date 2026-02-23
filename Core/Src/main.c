@@ -62,7 +62,6 @@ typedef enum {
 /*--------------------------- Module State ---------------------------------------*/
 static fall_state_t fall_state = FALL_NORMAL;
 static uint32_t t_confirm_ms = 0;
-static uint8_t freeze_uart = 0;
 
 static float prev_a_mag = 0.0f;
 static uint8_t prev_a_mag_valid = 0;
@@ -100,9 +99,11 @@ typedef enum {
     PAT_NONE = 0, PAT_FA, PAT_995, PAT_HELP
 } pattern_t;
 
-volatile pattern_t buzzer_req = PAT_NONE;
+volatile pattern_t buzzer_req = PAT_NONE; // this variable is changed in multiple functions, hence volatile
 
-/* Called automatically when a full line arrives (UART idle detected) */
+// Called automatically when a full line arrives (UART idle detected)
+// This handles the collection of entire message before calling interrupt function,
+// alternative to this is HAL_UART_RxCpltCallback, where it triggers everytime a bit arrives
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
     if (huart->Instance != USART1) return;
@@ -158,12 +159,13 @@ static void BUZZ_Init(void) {
 }
 
 static void buzzer_start(pattern_t p) {
-    bz.active  = true;
-    bz.pat     = p;
-    bz.step    = 0;
-    bz.next_ms = HAL_GetTick();
+	bz.active = true;
+	bz.pat = p;
+	bz.step = 0;
+	bz.next_ms = HAL_GetTick();
 }
 
+// these beeps follow morse code
 static void buzzer_update(void) {
     if (!bz.active) return;
 
@@ -233,7 +235,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
         char buffer[150];
         sprintf(buffer, "Not a False Alarm! User needs assistance!\r\n");
         HAL_UART_Transmit(&huart1, (uint8_t *)buffer, strlen(buffer), HAL_MAX_DELAY);
-		bz.pat = PAT_HELP; // Interrupt function so just arm the buzzer, main() will play buzzer
+		bz.pat = PAT_HELP; // interrupt function so just arm the buzzer, main() will play buzzer
 		bz.step = 0;
 		bz.next_ms = HAL_GetTick();
 		bz.active = true;
@@ -242,8 +244,9 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
 
 /* ========================= Main =========================================== */
 int main(void) {
-    const int N = 4;
 
+	const int N = 4;
+	// initialise system
     HAL_Init();
     BUZZ_Init();
     UART1_Init();
@@ -266,6 +269,7 @@ int main(void) {
     float a_mag, g_mag, jerk = 0;
     float total_base_pressure = 0;
 
+    // find base altitude when user is standing up
     char buffer[150];
     sprintf(buffer, "Stand up straight and wear the device\r\n");
     HAL_UART_Transmit(&huart1, (uint8_t *)buffer, strlen(buffer), HAL_MAX_DELAY);
@@ -276,8 +280,7 @@ int main(void) {
     HAL_UART_Transmit(&huart1, (uint8_t *)buffer, strlen(buffer), HAL_MAX_DELAY);
 
     for (int i = 0; i < BARO_COUNT; i++) total_base_pressure += BSP_PSENSOR_ReadPressure();
-
-
+    // found base altitude
     float base_pressure = total_base_pressure / BARO_COUNT;
     sprintf(buffer, "Calibration done!\r\n");
     HAL_UART_Transmit(&huart1, (uint8_t *)buffer, strlen(buffer), HAL_MAX_DELAY);
@@ -288,13 +291,15 @@ int main(void) {
     int   baro_count = 0;
 
     while (!stop_loop) {
+    	// get raw acc. data
         int16_t accel_data_i16[3] = { 0 };
         BSP_ACCELERO_AccGetXYZ(accel_data_i16);
-
+        // something like a rolling window, where only latest 4 readings are stored
         accel_buff_x[i % 4] = accel_data_i16[0];
         accel_buff_y[i % 4] = accel_data_i16[1];
         accel_buff_z[i % 4] = accel_data_i16[2];
 
+        // get raw acc. data
         float gyro_data[3] = { 0.0f };
         float *ptr_gyro = gyro_data;
         BSP_GYRO_GetXYZ(ptr_gyro);
@@ -304,11 +309,13 @@ int main(void) {
         gyro_velocity[1] = gyro_data[1] / 1000.0f;
         gyro_velocity[2] = gyro_data[2] / 1000.0f;
 
+        // calculate moving average of acc.
         float accel_filt_asm[3] = { 0 };
         accel_filt_asm[0] = (float)mov_avg(N, accel_buff_x) * (9.8f / 1000.0f);
         accel_filt_asm[1] = (float)mov_avg(N, accel_buff_y) * (9.8f / 1000.0f);
         accel_filt_asm[2] = (float)mov_avg(N, accel_buff_z) * (9.8f / 1000.0f);
 
+        // due to sensitivity of Barometer, collect 3-4 samples and determine the average
         float raw_pressure = BSP_PSENSOR_ReadPressure();
         total_base_pressure += raw_pressure;
         baro_count++;
@@ -324,23 +331,23 @@ int main(void) {
         }
 
         uint32_t now = HAL_GetTick();
-
+        // UART interrupt will turn this req. on --> main() loop will run it
         if (buzzer_req != PAT_NONE) {
             buzzer_start(buzzer_req);
             buzzer_req = PAT_NONE;
         }
         buzzer_update();
-
+        // get the time again, as (1) clearer (2) buzzer_update can take some time, now != t_ms
         uint32_t t_ms = HAL_GetTick();
         sprintf(buffer, "%lu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\r\n", t_ms,
                 accel_filt_asm[0], accel_filt_asm[1], accel_filt_asm[2],
                 gyro_velocity[0],  gyro_velocity[1],  gyro_velocity[2], current_altitude);
         HAL_UART_Transmit(&huart1, (uint8_t *)buffer, strlen(buffer), HAL_MAX_DELAY);
 
+        // obtain |a| and |g|
         float ax = accel_filt_asm[0];
         float ay = accel_filt_asm[1];
         float az = accel_filt_asm[2];
-
         a_mag = sqrtf_approx(ax * ax + ay * ay + az * az);
 
         float gx = gyro_data[0];
@@ -348,6 +355,8 @@ int main(void) {
         float gz = gyro_data[2];
         g_mag = sqrtf_approx(gx * gx + gy * gy + gz * gz);
 
+        // change in the angle is too large (> 220degrees)
+        // --> tested, if too small, triggers from just picking up
         uint8_t sudden_rot = (g_mag >= SUDDEN_GYRO_DPS_MIN);
 
         if (!prev_a_mag_valid) {
@@ -359,7 +368,7 @@ int main(void) {
         }
 
         uint8_t sudden_jerk   = (jerk >= SUDDEN_JERK_MIN);
-        uint8_t sudden_action = (sudden_rot || sudden_jerk);
+        uint8_t sudden_action = (sudden_rot || sudden_jerk); // either suddent jerk or sudden rot
 
         if (sudden_action && a_mag >= TRIGGER_A_MIN) {
 			impact_latched = 1;
@@ -373,8 +382,9 @@ int main(void) {
             impact_latched = 0;
         }
 
-        uint8_t stable_1g = (a_mag >= G_STABLE_MIN && a_mag <= G_STABLE_MAX);
+        uint8_t stable_1g = (a_mag >= G_STABLE_MIN && a_mag <= G_STABLE_MAX); // if outside this range, person might be falling down
 
+        // find dominant axis, initialise top1_axis as x, then compare with y and z
         float abx = absf(ax), aby = absf(ay), abz = absf(az);
         int top1_axis = 0;
         float top1 = abx;
@@ -394,11 +404,8 @@ int main(void) {
             float raw_vals[] = { ax, ay, az };
             char current_sign = (raw_vals[top1_axis] >= 0) ? '+' : '-';
             if (!prev_axis_valid) {
-				prev_axis = top1_axis;
-				prev_sign = current_sign;
-				prev_axis_valid = 1;
-				axis_candidate = top1_axis;
-				axis_candidate_ms = now;
+				prev_axis = top1_axis; prev_sign = current_sign; prev_axis_valid = 1;
+				axis_candidate = top1_axis; axis_candidate_ms = now;
             } else {
                 if (top1_axis != prev_axis) {
                     if (axis_candidate != top1_axis) {
@@ -409,12 +416,11 @@ int main(void) {
                     axis_candidate = top1_axis; axis_candidate_ms = now;
                 }
             }
-        }
+        } // fall is detected only if the axis has changed, check the impact_latched later in process_axis_transition
 
         if (fall_state == FALL_SUSPECT) {
 			if ((now - t_confirm_ms) >= FAST_BLINK_HOLD_MS) {
 				fall_state = FALL_NORMAL;
-				freeze_uart = 0;
 				impact_latched = 0;
 				prev_axis_valid = 0;
 				sprintf(buffer, "Resuming detection\r\n");
@@ -423,7 +429,7 @@ int main(void) {
 		}
 
         uint32_t toggle_ms = (fall_state == FALL_SUSPECT) ? FAST_TOGGLE_MS : NORMAL_TOGGLE_MS;
-        if ((now - led_last_toggle_ms) >= toggle_ms) {
+        if ((now - led_last_toggle_ms) >= toggle_ms) { // although not precise, sufficient to give visual effect
             BSP_LED_Toggle(LED2);
             led_last_toggle_ms = now;
         }
@@ -434,6 +440,7 @@ int main(void) {
 }
 
 /* ===================== process_axis_transition ============================ */
+// this function checks whether the change in axis is accompanied by a change in acc. / gyro.
 static void process_axis_transition(uint32_t now, int top1_axis,
         char current_sign, float base_pressure, float filtered_pressure) {
     if ((now - axis_candidate_ms) >= ORIENT_DEBOUNCE_MS) {
@@ -480,7 +487,6 @@ static void process_axis_transition(uint32_t now, int top1_axis,
             last_orient_trigger_ms = now;
             fall_state = FALL_SUSPECT;
             t_confirm_ms = now;
-            freeze_uart = 1;
         }
         prev_axis = top1_axis;
         prev_sign = current_sign;
@@ -513,7 +519,7 @@ static void UART1_Init(void) {
 
     if (HAL_UART_Init(&huart1) != HAL_OK) { while (1) {} }
 
-    HAL_NVIC_SetPriority(USART1_IRQn, 0, 0);
+    HAL_NVIC_SetPriority(USART1_IRQn, 0, 0); // UART Interrupt given highest priority
     HAL_NVIC_EnableIRQ(USART1_IRQn);
 }
 
