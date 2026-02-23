@@ -80,7 +80,9 @@ CSV_TO_FRAMES = next(
 FIELDNAMES = ["t_ms", "ax", "ay", "az", "gx", "gy", "gz", "fall_alt"]
 
 # Telegram cooldown so you don't spam initial alerts
-TELEGRAM_COOLDOWN_S = 10
+TELEGRAM_COOLDOWN_S = 1
+assist_last_seen_ts = 0.0
+ASSIST_MIN_INTERVAL = 1.0
 
 # ===== Reminder settings =====
 REMIND_EVERY_SECONDS = 15
@@ -571,9 +573,14 @@ def uart_loop():
         # Assist text trigger
         if ASSIST_TEXT in line:
             now = time.time()
-            if now - last_telegram_sent >= TELEGRAM_COOLDOWN_S:
+
+            global assist_last_seen_ts
+            if now - assist_last_seen_ts >= ASSIST_MIN_INTERVAL:
                 send_message("🚨 " + ASSIST_TEXT)
-                last_telegram_sent = now
+                assist_last_seen_ts = now
+            else:
+                print("[ASSIST] Suppressed duplicate press")
+
             continue
 
         # 2) Trigger handling (non-CSV lines)
