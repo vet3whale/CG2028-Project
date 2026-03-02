@@ -49,7 +49,7 @@ typedef enum {
 #define SUDDEN_GYRO_DPS_MIN     220.0f
 #define SUDDEN_JERK_MIN         2.5f
 
-#define TRIGGER_A_MIN           12.0f
+#define TRIGGER_A_MIN           12.5f
 #define PRESSURE_EMA_ALPHA      0.15f
 
 #define BARO_COUNT              100
