@@ -21,7 +21,7 @@ The mission was the eliminate long-lie incidents by designing a device that dete
 ## Python dependencies
 Install required packages: 
 ```bash
-pip install pyserial requests numpy trimesh scipy pyrender imageio[ffmpeg]`
+pip install pyserial requests numpy trimesh scipy pyrender imageio[ffmpeg]
 ```
 
 ## Instructions to use: 
